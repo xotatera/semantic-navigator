@@ -250,23 +250,25 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
     )
 
 
-def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices: list[int], cpu: bool, gpu_layers: int | None, n_ctx: int, debug: bool) -> list[Aspect]:
+def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices: list[tuple[int, int | None]], cpu: bool, gpu_layers: int | None, n_ctx: int, debug: bool) -> list[Aspect]:
     """Create local model aspects for GPU and/or CPU backends."""
     aspects: list[Aspect] = []
     if gpu:
-        model_size = _estimate_model_size(local, local_file, True, devices[0], n_ctx)
-        for device in devices:
-            vram = detect_device_memory(True, device)
-            if model_size is not None and vram is not None and vram < model_size:
-                print(f"Skipping GPU {device}: insufficient VRAM ({vram / 1e9:.1f} GB) for model ({model_size / 1e9:.1f} GB)")
-                continue
+        model_size = _estimate_model_size(local, local_file, True, devices[0][0], n_ctx)
+        for device_id, device_layers in devices:
+            effective_layers = device_layers if device_layers is not None else gpu_layers
+            if device_layers is None:
+                vram = detect_device_memory(True, device_id)
+                if model_size is not None and vram is not None and vram < model_size:
+                    print(f"Skipping GPU {device_id}: insufficient VRAM ({vram / 1e9:.1f} GB) for model ({model_size / 1e9:.1f} GB)")
+                    continue
             try:
-                model = _create_local_model(local, local_file, True, device, gpu_layers, n_ctx, debug)
+                model = _create_local_model(local, local_file, True, device_id, effective_layers, n_ctx, debug)
             except (ValueError, RuntimeError) as e:
-                print(f"Skipping GPU {device}: failed to load model ({e})")
+                print(f"Skipping GPU {device_id}: failed to load model ({e})")
                 continue
             aspects.append(Aspect(
-                name = f"local/gpu:{device}",
+                name = f"local/gpu:{device_id}",
                 cli_command = None,
                 local_model = model,
                 local_n_ctx = model.n_ctx(),
@@ -362,7 +364,7 @@ def _create_embedding_model(openai_embedding_model: str | None, embedding_model:
     return embedding, None, None, batch_size
 
 
-def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
+def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[tuple[int, int | None]], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
     aspects: list[Aspect] = []
 
     if local is not None:
@@ -375,8 +377,9 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
     if not aspects:
         raise SystemExit("Error: no inference backends available. All GPU devices were skipped or failed to load.")
 
+    device_ids = [d for d, _ in devices]
     embedding, openai_client_for_embed, _, resolved_batch_size = _create_embedding_model(
-        openai_embedding_model, embedding_model, gpu, devices, cpu_offload, batch_size,
+        openai_embedding_model, embedding_model, gpu, device_ids, cpu_offload, batch_size,
     )
 
     print(f"Initialized {len(aspects)} aspect{'s' if len(aspects) != 1 else ''}: {', '.join(a.name for a in aspects)}")

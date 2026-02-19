@@ -402,17 +402,33 @@ def count_cached_labels(ct: ClusterTree, repository: str, model_identity: str, c
     return (total_uncached, total_cached, total_cached_clusters)
 
 
-def _count_expected_calls(ct: ClusterTree, cached_keys: set[str]) -> int:
-    """Estimate the number of LLM calls needed to label the tree.
-    Each cluster node = 1 call, each leaf with uncached files = 1+ calls."""
+def _count_expected_calls(ct: ClusterTree, cached_keys: set[str], min_local_n_ctx: int | None) -> int:
+    """Count the number of LLM calls needed to label the tree.
+    Accounts for batch splitting in leaf nodes when using local models."""
     if not ct.children:
-        has_uncached = any(
-            content_hash(embed.content) not in cached_keys
-            for embed in ct.node.embeds
-        )
-        return 1 if has_uncached else 0
+        uncached_embeds = [
+            embed for embed in ct.node.embeds
+            if content_hash(embed.content) not in cached_keys
+        ]
+        if not uncached_embeds:
+            return 0
+        if min_local_n_ctx is not None:
+            max_chars = max(int((min_local_n_ctx - 4096) * 1.5) - 1000, 1000)
+            n_batches = 0
+            batch_size = 0
+            for embed in uncached_embeds:
+                size = min(len(embed.content), max_chars) + len(embed.entry) + 20
+                if batch_size > 0 and batch_size + size > max_chars:
+                    n_batches += 1
+                    batch_size = size
+                else:
+                    batch_size += size
+            if batch_size > 0:
+                n_batches += 1
+            return n_batches
+        return 1
 
-    total = sum(_count_expected_calls(child, cached_keys) for child in ct.children)
+    total = sum(_count_expected_calls(child, cached_keys, min_local_n_ctx) for child in ct.children)
     # This cluster node itself will make 1 call (cached or not, it updates progress)
     total += 1
     return total
@@ -473,7 +489,14 @@ async def _label_leaf_node(facets: Facets, ct: ClusterTree, progress: tqdm) -> l
             rendered_embeds = "\n\n".join([ render_embed(embed) for _, embed in batch ])
 
             prompt = (
-                f"Label each file in 3 to 7 words. Don't include file path/names in descriptions.\n"
+                f"Label each file for a semantic file browser. Be specific (\"Rate Limiting Middleware\" not \"Server Task\").\n"
+                f"Use filenames for context but don't copy paths verbatim. Each label must be unique across files.\n"
+                f"Label based on the file's ROLE in the project (config, test, interface, implementation, migration, etc.), not just its content.\n"
+                f"For config/dotfiles, the theme should reflect their role (e.g. \"Build Configuration\", \"Editor Settings\"), not what they mention.\n"
+                f"distinguishingFeature MUST be unique per file — for sibling files, distinguish by role: impl vs interface vs adapter vs test.\n"
+                f"overarchingTheme=broad domain (use consistent terms: pick ONE term for similar concepts, don't alternate synonyms).\n"
+                f"distinguishingFeature=what makes THIS file different from its siblings, label=3-7 word purpose.\n"
+                f"Example: {{\"overarchingTheme\": \"Authentication\", \"distinguishingFeature\": \"Token verification logic\", \"label\": \"HTTP Auth Token Verification\"}}\n"
                 f"Return exactly {len(batch)} label{'s' if len(batch) != 1 else ''}, one per file.\n\n"
                 f"{rendered_embeds}\n\n"
                 f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
@@ -527,7 +550,10 @@ async def _label_cluster_node(facets: Facets, ct: ClusterTree, progress: tqdm) -
 
     schema = json.dumps(Labels.model_json_schema(), indent=2)
     prompt = (
-        f"Label each cluster in 2 words. Don't include file path/names in labels.\n"
+        f"Label each cluster for a semantic file browser. No file paths/names in any field. Describe shared purpose, not just technology.\n"
+        f"overarchingTheme=broad domain (use consistent terms across clusters — don't alternate synonyms like \"Styling\"/\"Web Design\"/\"UI Styling\").\n"
+        f"distinguishingFeature=what distinguishes THIS cluster from its siblings, label=2-4 word category.\n"
+        f"Example: {{\"overarchingTheme\": \"Data Persistence\", \"distinguishingFeature\": \"Schema Migrations\", \"label\": \"Database Migrations\"}}\n"
         f"Return exactly {len(treess)} label{'s' if len(treess) != 1 else ''}, one per cluster.\n\n"
         f"{rendered_clusters}\n\n"
         f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
@@ -550,6 +576,82 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
     return await _label_cluster_node(facets, ct, progress)
 
 
+def export_cluster_tree(facets: Facets, ct: ClusterTree) -> dict:
+    """Export cluster tree as JSON for external labeling (no LLM needed).
+    Walks the ClusterTree and produces leaf clusters (with file content)
+    and hierarchy (parent→child relationships with child labels for context)."""
+
+    leaf_clusters = []
+    hierarchy = []
+
+    def walk(node: ClusterTree) -> None:
+        all_files = [e.entry for e in node.node.embeds]
+        c_key = cluster_hash(all_files)
+
+        if not node.children:
+            # Leaf cluster
+            leaf_clusters.append({
+                "cluster_id": c_key,
+                "files": [
+                    {"path": e.entry, "content": e.content}
+                    for e in node.node.embeds
+                ],
+            })
+        else:
+            # Non-leaf: recurse children first, then record hierarchy
+            child_infos = []
+            for child in node.children:
+                walk(child)
+                child_files = [e.entry for e in child.node.embeds]
+                child_infos.append({
+                    "cluster_id": cluster_hash(child_files),
+                    "child_labels": [e.entry for e in child.node.embeds],
+                })
+
+            hierarchy.append({
+                "cluster_id": c_key,
+                "children": child_infos,
+            })
+
+    walk(ct)
+
+    return {
+        "model_identity": facets.model_identity,
+        "repository": facets.repository,
+        "leaf_clusters": leaf_clusters,
+        "hierarchy": hierarchy,
+    }
+
+
+def import_labels(facets: Facets, data: dict) -> None:
+    """Import labels from JSON into the label cache."""
+    ldir = label_cache_dir(facets.repository, facets.model_identity)
+
+    # Import file labels
+    for path, label_data in data.get("file_labels", {}).items():
+        label = Label(**label_data)
+        # We need to reconstruct the content hash the same way embed() does
+        # Read the file to compute its content hash
+        abs_path = os.path.join(facets.repository, path)
+        try:
+            with open(abs_path, "rb") as f:
+                text = f.read().decode("utf-8")
+            key = content_hash(f"{path}:\n\n{text}")
+            save_cached_label(ldir, key, label)
+        except (FileNotFoundError, UnicodeDecodeError, PermissionError) as e:
+            print(f"Warning: skipping {path}: {e}")
+
+    # Import cluster labels
+    for cluster_id, labels_list in data.get("cluster_labels", {}).items():
+        labels = Labels(labels=[Label(**l) for l in labels_list])
+        # cluster_id here maps to the cluster_hash of sorted file list
+        # We store it with the "cluster-" prefix via save_cached_cluster_labels
+        # But we need the actual cluster_hash. The caller provides it as the key.
+        save_cached_cluster_labels(ldir, cluster_id, labels)
+
+    print(f"Imported {len(data.get('file_labels', {}))} file labels, {len(data.get('cluster_labels', {}))} cluster labels")
+
+
 async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float] | None = None) -> Tree:
     with timed("Clustering", timings):
         ct = build_cluster_tree(c)
@@ -568,7 +670,7 @@ async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float]
     if uncached_files > 0:
         print(f"Labeling {uncached_files} uncached files...", flush=True)
     cached_keys = list_cached_keys(label_cache_dir(facets.repository, facets.model_identity), ".json")
-    total_calls = _count_expected_calls(ct, cached_keys)
+    total_calls = _count_expected_calls(ct, cached_keys, facets.pool.min_local_n_ctx)
     with timed("Labeling", timings):
         with tqdm(total = total_calls, desc = "Labeling", unit = "call", leave = False) as progress:
             children = await label_nodes(facets, ct, progress)
