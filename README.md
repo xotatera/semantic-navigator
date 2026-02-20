@@ -18,6 +18,7 @@ You will need a labeling backend — one of:
 - A CLI AI tool that reads from stdin and writes to stdout (e.g. `gemini`, `llm`, `aichat`)
 - OpenAI API via `--openai` (requires `OPENAI_API_KEY`)
 - A local GGUF model via `--local`
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via the built-in skill (no API key needed)
 
 You can combine multiple backends (e.g. `--local model --openai`) and work will
 be distributed across them.
@@ -176,6 +177,30 @@ $ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --openai ./repo
 
 # Local model + CLI tool
 $ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gemini ./repo
+```
+
+### Claude Code skill
+
+If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), you can use the built-in skill to label repositories without configuring any other backend. Claude itself acts as the labeling engine.
+
+```ShellSession
+# From within the semantic-navigator project directory
+$ claude /skill semantic-navigator
+
+# Or from any directory (skill prompts you for the repository path)
+$ claude /skill semantic-navigator
+```
+
+The skill orchestrates the full pipeline: it runs `--export-clusters` to embed and cluster files (locally, no LLM), labels everything directly in the Claude session, then runs `--import-labels` to populate the cache and launch the TUI.
+
+You can also use the export/import flags manually:
+
+```ShellSession
+# Export clusters for external labeling (no LLM needed)
+$ semantic-navigator ./repo --export-clusters clusters.json
+
+# Import labels from a JSON file and launch TUI
+$ semantic-navigator ./repo --import-labels labels.json
 ```
 
 ### Advanced options
